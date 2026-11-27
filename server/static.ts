@@ -93,7 +93,11 @@ function cacheControlFor(pathname: string): string {
  *   in the page means.
  * - `form-action 'self'`: every form is submitted by script, but a form that ever grows
  *   an action must not post this PC's credentials somewhere else.
- * - `frame-ancestors 'none'`: nothing frames the app itself.
+ * - `frame-ancestors 'none'`: nothing frames the app itself, with one exception: the app shell (the
+ *   document every page of the app is) may be framed by the exact origins OVIS_FRAME_ANCESTORS
+ *   names (`frameAncestors`), so another page of the owner's, such as a project board, can show a
+ *   live chat inline. Every other answer keeps 'none'. No X-Frame-Options is sent anywhere; a
+ *   browser that knows frame-ancestors ignores X-Frame-Options anyway.
  */
 const CSP_DIRECTIVES = [
   "default-src 'self'",
@@ -120,16 +124,82 @@ export const CONTENT_SECURITY_POLICY = CSP_DIRECTIVES.join("; ");
 /** A host name or bracketed IPv6 address, nothing that could end or add a directive. */
 const FRAMEABLE_HOST = /^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*|\[[0-9a-f:.]+\])$/i;
 
-/** The policy for a request from `origin` (requestOrigin): its host's other ports may be framed. */
-export function contentSecurityPolicy(origin?: string): string {
+/**
+ * The pages allowed to frame the app shell when OVIS_FRAME_ANCESTORS is unset: the owner's project
+ * board in production and its local dev server. Origins only, never a pattern.
+ */
+export const DEFAULT_FRAME_ANCESTORS: readonly string[] = ["https://pms.oliveline.app", "http://127.0.0.1:2969", "http://pms.localhost:2969"];
+
+/**
+ * OVIS_FRAME_ANCESTORS, read: the exact origins (`scheme://host[:port]`, http or https) that may
+ * frame the app shell, separated by spaces or commas. Anything else is dropped and reported in
+ * `rejected`: a wildcard (`*`, `https://*.example.com`, `https://example.com:*`), a bare scheme
+ * (`https:`), a keyword (`'self'`, `'none'`), a path, query or fragment, credentials, or another
+ * scheme. Unset means DEFAULT_FRAME_ANCESTORS; set but empty (or `none`) means nothing frames it.
+ */
+export function parseFrameAncestors(raw: string | undefined): { origins: string[]; rejected: string[] } {
+  if (raw === undefined) return { origins: [...DEFAULT_FRAME_ANCESTORS], rejected: [] };
+  const origins: string[] = [];
+  const rejected: string[] = [];
+  for (const entry of raw.split(/[\s,]+/).filter(Boolean)) {
+    if (entry.toLowerCase() === "none") continue;
+    const origin = exactOrigin(entry);
+    if (origin === null) rejected.push(entry);
+    else if (!origins.includes(origin)) origins.push(origin);
+  }
+  return { origins, rejected };
+}
+
+/** `entry` as a serialized origin when it is one exactly (a trailing `/` aside), else null. */
+function exactOrigin(entry: string): string | null {
+  if (/[*'";?#@\\]/.test(entry)) return null;
+  let url: URL;
+  try {
+    url = new URL(entry);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return null;
+  if (url.pathname !== "/" || /^[a-z]+:\/\/[^/]+\/./i.test(entry)) return null;
+  if (!FRAMEABLE_HOST.test(url.hostname)) return null;
+  return url.origin;
+}
+
+let warnedFrameAncestors: string | undefined;
+
+/** The origins that may frame the app shell now: read on every request, like OVIS_CSP. */
+export function frameAncestors(): string[] {
+  const raw = process.env["OVIS_FRAME_ANCESTORS"];
+  const { origins, rejected } = parseFrameAncestors(raw);
+  if (rejected.length > 0 && warnedFrameAncestors !== raw) {
+    warnedFrameAncestors = raw;
+    console.warn(`OVIS_FRAME_ANCESTORS: ignored ${rejected.map((entry) => JSON.stringify(entry)).join(", ")}: only exact http(s) origins may frame the app`);
+  }
+  return origins;
+}
+
+/**
+ * The policy for a request from `origin` (requestOrigin): its host's other ports may be framed.
+ * `ancestors` are the exact origins that may frame this answer (the shell's, `frameAncestors`);
+ * none keeps `frame-ancestors 'none'`.
+ */
+export function contentSecurityPolicy(origin?: string, ancestors: readonly string[] = []): string {
   let host: string | null = null;
   try {
     host = origin === undefined ? null : new URL(origin).hostname;
   } catch {
     host = null;
   }
-  if (host === null || !FRAMEABLE_HOST.test(host)) return CONTENT_SECURITY_POLICY;
-  return CSP_DIRECTIVES.map((directive) => directive === "frame-src 'self'" ? `frame-src 'self' http://${host}:* https://${host}:*` : directive).join("; ");
+  const frameSrc = host === null || !FRAMEABLE_HOST.test(host) ? null : `frame-src 'self' http://${host}:* https://${host}:*`;
+  // validated again here so no caller can hand a pattern or a directive through
+  const allowed = ancestors.map((entry) => exactOrigin(entry)).filter((entry): entry is string => entry !== null);
+  if (frameSrc === null && allowed.length === 0) return CONTENT_SECURITY_POLICY;
+  return CSP_DIRECTIVES.map((directive) => {
+    if (directive === "frame-src 'self'" && frameSrc !== null) return frameSrc;
+    if (directive === "frame-ancestors 'none'" && allowed.length > 0) return `frame-ancestors ${allowed.join(" ")}`;
+    return directive;
+  }).join("; ");
 }
 
 /**
@@ -137,9 +207,9 @@ export function contentSecurityPolicy(origin?: string): string {
  *   logs what the policy would have blocked and the app keeps working. `report-only` is the
  *   measurement mode; anything else enforces.
  */
-function cspHeader(origin?: string): Record<string, string> {
+function cspHeader(origin?: string, ancestors: readonly string[] = []): Record<string, string> {
   const mode = process.env["OVIS_CSP"];
-  const policy = contentSecurityPolicy(origin);
+  const policy = contentSecurityPolicy(origin, ancestors);
   return mode === "report-only"
     ? { "content-security-policy-report-only": policy }
     : { "content-security-policy": policy };
@@ -245,7 +315,7 @@ export async function serveStatic(pathname: string, acceptEncoding?: string | nu
       }
       const kind = pathname === "/manifest.webmanifest" ? "manifest" : candidate === indexPath ? "shell" : null;
       return new Response(await body(file, kind, origin), {
-        headers: { "content-type": contentTypeFor(candidate), "cache-control": cacheControlFor(pathname), ...cspHeader(origin) },
+        headers: { "content-type": contentTypeFor(candidate), "cache-control": cacheControlFor(pathname), ...cspHeader(origin, kind === "shell" ? frameAncestors() : []) },
       });
     }
   }
@@ -255,6 +325,6 @@ export async function serveStatic(pathname: string, acceptEncoding?: string | nu
     return new Response(null, { status: 404, headers: { "cache-control": REVALIDATE, ...cspHeader() } });
   }
   return new Response(await body(Bun.file(indexPath), "shell"), {
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": REVALIDATE, ...cspHeader(origin) },
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": REVALIDATE, ...cspHeader(origin, frameAncestors()) },
   });
 }

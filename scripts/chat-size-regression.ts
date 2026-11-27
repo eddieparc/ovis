@@ -1128,7 +1128,7 @@ export async function checkInactiveAttachLifecycle(browser: Browser, origin: str
         const policy = headers["content-security-policy"];
         assert.ok(policy);
         await route.fulfill({ response, headers: { ...headers,
-          "content-security-policy": policy.replace("frame-ancestors 'none'", "frame-ancestors 'self'") } });
+          "content-security-policy": policy.replace(/frame-ancestors [^;]+/, "frame-ancestors 'self'") } });
       });
       await page.goto(`${origin}/embed-test`);
       let timer: ReturnType<typeof setTimeout> | undefined;
