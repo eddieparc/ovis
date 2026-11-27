@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { appName, CONTENT_SECURITY_POLICY, contentSecurityPolicy, manifestBody, relateManifest, renameManifest, renameShell, requestOrigin } from "./static.ts";
+import { appName, CONTENT_SECURITY_POLICY, contentSecurityPolicy, DEFAULT_FRAME_ANCESTORS, frameAncestors, manifestBody, parseFrameAncestors, relateManifest, renameManifest, renameShell, requestOrigin } from "./static.ts";
 
 // The sources Vite builds from: public/ is copied into dist/ as it is, and the meta survives the build.
 const root = join(import.meta.dir, "..");
@@ -83,5 +83,63 @@ describe("OVIS_APP_NAME", () => {
   it("escapes the name in the shell", () => {
     const renamed = renameShell(shell, `a"b<c>&$1 $&`);
     expect(renamed).toContain('content="a&quot;b&lt;c&gt;&amp;$1 $&amp;"');
+  });
+});
+
+describe("OVIS_FRAME_ANCESTORS", () => {
+  const previous = process.env["OVIS_FRAME_ANCESTORS"];
+  afterEach(() => {
+    if (previous === undefined) delete process.env["OVIS_FRAME_ANCESTORS"]; else process.env["OVIS_FRAME_ANCESTORS"] = previous;
+  });
+
+  it("defaults to exactly the project board's origins", () => {
+    expect(DEFAULT_FRAME_ANCESTORS).toEqual(["https://pms.oliveline.app", "http://127.0.0.1:2969", "http://pms.localhost:2969"]);
+    expect(parseFrameAncestors(undefined)).toEqual({ origins: [...DEFAULT_FRAME_ANCESTORS], rejected: [] });
+    delete process.env["OVIS_FRAME_ANCESTORS"];
+    expect(frameAncestors()).toEqual([...DEFAULT_FRAME_ANCESTORS]);
+    expect(contentSecurityPolicy(undefined, frameAncestors()))
+      .toContain("; frame-ancestors https://pms.oliveline.app http://127.0.0.1:2969 http://pms.localhost:2969");
+  });
+
+  it("takes exact origins separated by spaces or commas, normalized and once each", () => {
+    expect(parseFrameAncestors("https://board.example, http://127.0.0.1:2969  HTTPS://Board.Example/ https://board.example:8443"))
+      .toEqual({ origins: ["https://board.example", "http://127.0.0.1:2969", "https://board.example:8443"], rejected: [] });
+  });
+
+  it("drops wildcards, bare schemes, keywords and anything that is not an origin", () => {
+    const rejected = ["*", "https://*.example.com", "https://example.com:*", "*.example.com", "https:", "http:", "https://",
+      "'self'", "'none'", "'unsafe-inline'", "data:", "blob:", "ftp://example.com", "javascript:alert(1)",
+      "https://example.com/path", "https://example.com/.", "https://example.com?x", "https://example.com#x",
+      "https://user:pass@example.com", "example.com", "https://a_b", "https://example.com;script-src"];
+    expect(parseFrameAncestors(rejected.join(" "))).toEqual({ origins: [], rejected });
+    expect(parseFrameAncestors(`* https://pms.example https://*.example.com`)).toEqual({ origins: ["https://pms.example"], rejected: ["*", "https://*.example.com"] });
+  });
+
+  it("frames nothing when set empty or to none, and warns once about what it dropped", () => {
+    expect(parseFrameAncestors("")).toEqual({ origins: [], rejected: [] });
+    expect(parseFrameAncestors("none")).toEqual({ origins: [], rejected: [] });
+    process.env["OVIS_FRAME_ANCESTORS"] = "";
+    expect(contentSecurityPolicy(undefined, frameAncestors())).toBe(CONTENT_SECURITY_POLICY);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env["OVIS_FRAME_ANCESTORS"] = "https://*.example.com *";
+      expect(frameAncestors()).toEqual([]);
+      expect(frameAncestors()).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("https://*.example.com");
+      expect(contentSecurityPolicy(undefined, frameAncestors())).toContain("frame-ancestors 'none'");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("puts only the allowed origins into frame-ancestors and leaves every other directive as it was", () => {
+    const policy = contentSecurityPolicy("https://pc.tailnet.ts.net", ["https://pms.example", "https://*.evil.example", "*", "'self'"]);
+    expect(policy).toContain("; frame-ancestors https://pms.example");
+    expect(policy.split("; ").find((directive) => directive.startsWith("frame-ancestors"))).toBe("frame-ancestors https://pms.example");
+    expect(policy).not.toContain("evil");
+    expect(policy).not.toContain("frame-ancestors 'none'");
+    expect(policy.replace("frame-ancestors https://pms.example", "frame-ancestors 'none'")).toBe(contentSecurityPolicy("https://pc.tailnet.ts.net"));
+    expect(contentSecurityPolicy(undefined, ["*"])).toBe(CONTENT_SECURITY_POLICY);
   });
 });
